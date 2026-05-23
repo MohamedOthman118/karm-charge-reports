@@ -18,7 +18,7 @@ from datetime import date, datetime
 import streamlit as st
 from docx import Document
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
@@ -393,11 +393,171 @@ def _add_at_a_glance_table(doc, summary_text):
 # DOCX BUILDER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _add_page_number_field(run):
+    """Insert a Word PAGE field into the given run so Word renders the live page number."""
+    fld_begin = OxmlElement("w:fldChar")
+    fld_begin.set(qn("w:fldCharType"), "begin")
+
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = "PAGE"
+
+    fld_end = OxmlElement("w:fldChar")
+    fld_end.set(qn("w:fldCharType"), "end")
+
+    run._element.append(fld_begin)
+    run._element.append(instr)
+    run._element.append(fld_end)
+
+
+def _remove_cell_borders(cell):
+    """Strip all four borders from a single table cell (used for invisible header/footer tables)."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    # Remove any existing tcBorders
+    existing = tcPr.find(qn("w:tcBorders"))
+    if existing is not None:
+        tcPr.remove(existing)
+    tcBorders = OxmlElement("w:tcBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        b = OxmlElement(f"w:{edge}")
+        b.set(qn("w:val"), "nil")
+        tcBorders.append(b)
+    tcPr.append(tcBorders)
+
+
+def _add_paragraph_border(paragraph, edge: str, color_hex: str = "BFBFBF", size: str = "4"):
+    """Add a horizontal rule on one edge of a paragraph (used to separate header/footer from body)."""
+    pPr = paragraph._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    bdr  = OxmlElement(f"w:{edge}")
+    bdr.set(qn("w:val"),   "single")
+    bdr.set(qn("w:sz"),    size)
+    bdr.set(qn("w:space"), "1")
+    bdr.set(qn("w:color"), color_hex)
+    pBdr.append(bdr)
+    pPr.append(pBdr)
+
+
+def _apply_header_footer(doc, report_id: str):
+    """
+    Reliable layout via invisible tables (tab stops break when text overflows).
+
+    Header (every page, 3 columns):
+        Left   : KARM CHARGE  —  EV Charger Operations & Diagnostic Report
+        Center : Internal – Operations
+        Right  : <report_id / file name>
+
+    Footer (every page, 2 columns):
+        Left   : Karm Charge · Operations Report · Internal
+        Right  : <live page number>
+    """
+    section = doc.sections[0]
+
+    # ── HEADER ───────────────────────────────────────────────────────────────
+    header = section.header
+    # Clear default empty paragraph so the table sits at the top
+    header.paragraphs[0].text = ""
+
+    h_table = header.add_table(rows=1, cols=3, width=Inches(6.5))
+    h_table.autofit = False
+    h_table.allow_autofit = False
+    # Column widths: prioritize left (full title needs room), then center, then right
+    h_table.columns[0].width = Inches(3.6)   # brand + title
+    h_table.columns[1].width = Inches(1.5)   # classification
+    h_table.columns[2].width = Inches(1.4)   # report ID
+
+    l_cell, m_cell, r_cell = h_table.rows[0].cells
+    for cell in (l_cell, m_cell, r_cell):
+        _remove_cell_borders(cell)
+
+    # Left cell — brand + title
+    l_cell.width = Inches(3.6)
+    lp = l_cell.paragraphs[0]
+    lp.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    lp.paragraph_format.space_after = Pt(2)
+    r_brand = lp.add_run("KARM CHARGE")
+    r_brand.bold = True
+    r_brand.font.size = Pt(8)
+    r_brand.font.color.rgb = BRAND_GREEN
+    r_sep = lp.add_run("  —  ")
+    r_sep.font.size = Pt(8)
+    r_sep.font.color.rgb = GREY_TEXT
+    r_title = lp.add_run("EV Charger Operations & Diagnostic Report")
+    r_title.bold = True
+    r_title.font.size = Pt(8)
+    r_title.font.color.rgb = HEADER_BLUE
+
+    # Middle cell — classification
+    m_cell.width = Inches(1.5)
+    mp = m_cell.paragraphs[0]
+    mp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    mp.paragraph_format.space_after = Pt(2)
+    rm = mp.add_run("Internal – Operations")
+    rm.font.size = Pt(8)
+    rm.font.color.rgb = GREY_TEXT
+
+    # Right cell — file name (report ID)
+    r_cell.width = Inches(1.4)
+    rp = r_cell.paragraphs[0]
+    rp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    rp.paragraph_format.space_after = Pt(2)
+    rr = rp.add_run(report_id)
+    rr.font.size = Pt(8)
+    rr.font.color.rgb = GREY_TEXT
+
+    # Thin grey rule between header and body
+    rule_p = header.add_paragraph()
+    rule_p.paragraph_format.space_before = Pt(0)
+    rule_p.paragraph_format.space_after  = Pt(0)
+    _add_paragraph_border(rule_p, edge="bottom")
+
+    # ── FOOTER ───────────────────────────────────────────────────────────────
+    footer = section.footer
+    # Top rule above footer
+    rule_f = footer.paragraphs[0]
+    rule_f.text = ""
+    rule_f.paragraph_format.space_before = Pt(0)
+    rule_f.paragraph_format.space_after  = Pt(0)
+    _add_paragraph_border(rule_f, edge="top")
+
+    f_table = footer.add_table(rows=1, cols=2, width=Inches(6.5))
+    f_table.autofit = False
+    f_table.allow_autofit = False
+    f_table.columns[0].width = Inches(5.5)   # text on the left
+    f_table.columns[1].width = Inches(1.0)   # page number on the right
+
+    fl_cell, fr_cell = f_table.rows[0].cells
+    for cell in (fl_cell, fr_cell):
+        _remove_cell_borders(cell)
+
+    # Left footer
+    fl_cell.width = Inches(5.5)
+    flp = fl_cell.paragraphs[0]
+    flp.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    fr_left = flp.add_run("Karm Charge  ·  Operations Report  ·  Internal")
+    fr_left.italic = True
+    fr_left.font.size = Pt(8)
+    fr_left.font.color.rgb = GREY_TEXT
+
+    # Right footer — live page number
+    fr_cell.width = Inches(1.0)
+    frp = fr_cell.paragraphs[0]
+    frp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    pn_run = frp.add_run()
+    pn_run.font.size = Pt(8)
+    pn_run.font.color.rgb = GREY_TEXT
+    _add_page_number_field(pn_run)
+
+
 def build_docx(data: dict) -> bytes:
     doc = Document()
     for section in doc.sections:
         section.top_margin = section.bottom_margin = Inches(1)
         section.left_margin = section.right_margin = Inches(1)
+
+    # ── Repeating header & footer on every page ──────────────────────────────
+    _apply_header_footer(doc, data.get("report_id", ""))
 
     # ── Title ────────────────────────────────────────────────────────────────
     for text, size, color, italic in [
@@ -509,12 +669,7 @@ def build_docx(data: dict) -> bytes:
     else:
         doc.add_paragraph("No open action items logged.").runs[0].font.size = Pt(10)
 
-    # ── Footer ───────────────────────────────────────────────────────────────
-    fp = doc.add_paragraph(); fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    fp.paragraph_format.space_before = Pt(24)
-    fr = fp.add_run(f"KARM CHARGE  ·  {data['report_id']}  ·  Confidential – Internal Use Only")
-    fr.italic = True; fr.font.size = Pt(8); fr.font.color.rgb = GREY_TEXT
-
+    # ── Save ─────────────────────────────────────────────────────────────────
     buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
 
 
